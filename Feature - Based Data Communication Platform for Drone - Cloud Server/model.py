@@ -275,34 +275,66 @@ class Drone:
     @torch.no_grad()
     def get_feature(self):
         """
-        获取当前图像的128维特征
+        获取当前图像的512维特征
         """
         if self.current_image is None:
             return None
         self.feature_extractor.eval()
         img_batch = self.current_image.unsqueeze(0).to(self.device)  # [1,3,H,W]
-        feature = self.feature_extractor(img_batch)  # [1,128]
-        return feature.squeeze(0)  # [128]
+        feature = self.feature_extractor(img_batch)  # [1,512]
+        return feature.squeeze(0)  # [512]
     
     def send_feature_to_cloud(self, cloud_server):
         feature = self.get_feature()
         if feature is not None:
-            cloud_server.receive_feature(feature, self)
+            return cloud_server.receive_feature(feature, self)
     
     def send_raw_image_to_cloud(self, cloud_server):
         """
         当云端请求原图时，发送
         """
         print("Drone: >>> 上传原图到云端!")
-        cloud_server.receive_raw_image(self.current_image)
+        return cloud_server.receive_raw_image(self.current_image)
+    
+
+class bandwise_limitation:
+    def __init__(self,max_frames):
+        self.max_frames = max_frames
+        self.number = 0
+        self.state = False 
+
+    def add(self):
+        self.number = self.number+1
+    
+    def initial(self):
+        if not self.state:
+            self.number = 0
+        self.state = True
+    
+    def judge(self):
+        if self.number <= self.max_frames and self.state:
+            return False
+        else:
+            self.state = False
+            return True 
+        
 
 class CloudServer:
     """
-    云服务器：接收 128维特征 -> 通过决策网络判断 -> 请求或不请求原图
+    云服务器：接收 512维特征 -> 通过决策网络判断 -> 请求或不请求原图
     """
-    def __init__(self, decision_net, device):
+    def __init__(self, decision_net, device ,features_clf,serve_clf,bandwise_limitation):
         self.decision_net = decision_net.to(device)
         self.device = device
+        self.features_clf = features_clf
+        self.serve_clf = serve_clf
+        self.features_clf.eval()
+        self.serve_clf.eval()
+        self.features_clf.to(self.device)
+        self.serve_clf.to(self.device)
+        self.num = 0
+        self.abc = bandwise_limitation
+
     
     def receive_feature(self, feature, drone):
         self.decision_net.eval()
@@ -312,14 +344,28 @@ class CloudServer:
             score_val = score.item()
         
         print(f"Cloud: decision score={score_val:.4f}", end=" | ")
-        if score_val > 0.5:
+        self.abc.add()
+        if score_val > 0.5 and not self.abc.judge():
+                print("带宽不足")
+        if score_val > 0.5 and self.abc.judge():
+            self.abc.initial()
             print("需要原图 -> 向无人机请求")
-            drone.send_raw_image_to_cloud(self)
+            self.num += 1
+            return drone.send_raw_image_to_cloud(self)
+            
         else:
+           
             print("不需要原图(置信度足够)")
+            return self.features_clf(feature)
     
     def receive_raw_image(self, image):
         print(f"Cloud: 已收到原图, 尺寸={tuple(image.shape)}, 在云端执行高阶任务...\n")
+        img_batch = image.unsqueeze(0).to(self.device)
+        
+        y = self.serve_clf(img_batch) 
+        return y
+        
+
 
 # ------------------------------------------------------------------------------------
 # 8. 模拟在线推理过程
@@ -338,7 +384,6 @@ def simulate_edge_cloud_inference(drone, cloud_server, test_loader, device, num_
             print(f"[Image #{count+1}] 无人机先上传特征 -> 云端决策")
             drone.send_feature_to_cloud(cloud_server)
             count += 1
-
 # ------------------------------------------------------------------------------------
 # 9. 额外模块：比较『有决策网络』vs『无决策网络』效果
 # ------------------------------------------------------------------------------------
@@ -435,6 +480,166 @@ def plot_comparison(results):
     plt.savefig("scenario_comparison.png")
     plt.show()
 
+class ResNetCIFAR10_serve(nn.Module):
+    """
+    以预训练的 ResNet18 作为骨干，并修改最后一层输出 10 类 (CIFAR10)。
+    """
+    def __init__(self, num_classes=10):
+        super(ResNetCIFAR10_serve, self).__init__()
+        # 加载官方预训练 ResNet18
+        self.model = models.resnet50(weights=models.ResNet50_Weights.DEFAULT)
+        # 替换最后一层全连接，以适配 CIFAR10 的 10 类
+        in_features = self.model.fc.in_features
+        self.model.fc = nn.Linear(in_features, num_classes)
+    
+    def forward(self, x):
+        # 返回 [B, 10] logits
+        return self.model(x)
+
+def train_classifier(model, train_loader, val_loader, device, epochs=2, lr=1e-3):
+    """
+    简单示例：微调 ResNet50 用于 CIFAR10 分类，并训练若干 epoch。
+    """
+    model.to(device)
+    optimizer = optim.Adam(model.parameters(), lr=lr)
+    criterion = nn.CrossEntropyLoss()
+    
+    for epoch in range(epochs):
+        model.train()
+        running_loss = 0.0
+        # 训练过程添加进度条
+        for images, labels in tqdm(train_loader, desc=f"Training Epoch {epoch+1}/{epochs}"):
+            images = images.to(device)
+            labels = labels.to(device)
+            
+            outputs = model(images)
+            loss = criterion(outputs, labels)
+            
+            
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            
+            running_loss += loss.item() * images.size(0)
+        
+        train_loss = running_loss / len(train_loader.dataset)
+        val_loss = evaluate_classifier(model, val_loader, device, criterion)
+        print(f"[Classifier] Epoch {epoch+1}/{epochs} | Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f}")
+    return model
+
+class ServeFeaturesClassifier(nn.Module):
+    def __init__(self, f_dim=512, num_classes=10):
+        super(ServeFeaturesClassifier, self).__init__()  # 使用 super() 来初始化父类
+        self.linear = nn.Linear(f_dim, f_dim // 2)
+        self.relu = nn.ReLU()
+        self.fc = nn.Linear(f_dim // 2, num_classes)
+
+    def forward(self, x):
+        x = self.linear(x)
+        x = self.relu(x)
+        x = self.fc(x)
+        return x
+
+
+
+def train_feature_classifier(model,backbone, train_loader, val_loader, device, epochs=2, lr=1e-3):
+    """
+    简单示例：微调 ResNet18 用于 CIFAR10 分类，并训练若干 epoch。
+    """
+    feature_extractor = FeatureExtractor(backbone).to(device)
+    model.to(device)
+    optimizer = optim.Adam(model.parameters(), lr=lr)
+    criterion = nn.CrossEntropyLoss()
+    
+    for epoch in range(epochs):
+        model.train()
+        running_loss = 0.0
+        # 训练过程添加进度条
+        for images, labels in tqdm(train_loader, desc=f"Training Epoch {epoch+1}/{epochs}"):
+            images = images.to(device)
+            labels = labels.to(device)
+
+            # 提取特征
+            with torch.no_grad():
+                features = feature_extractor(images)
+
+            
+            outputs = model(features)
+            loss = criterion(outputs, labels)
+            
+            
+            
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            
+            running_loss += loss.item() * images.size(0)
+        
+        train_loss = running_loss / len(train_loader.dataset)
+        #val_loss = evaluate_classifier(model, val_loader, device, criterion)
+        print(f"[Classifier] Epoch {epoch+1}/{epochs} | Train Loss: {train_loss:.4f} ")
+    return model
+
+
+def test_classifier_accuracy(model, feature_extractor,test_loader, device):
+    """
+    测试模型在测试集上的准确率
+    """
+    model.eval()  # 设置模型为评估模式
+    correct = 0
+    total = 0
+    
+    with torch.no_grad():  # 不计算梯度，节省内存和计算
+        for images, labels in test_loader:
+            images = images.to(device)
+            labels = labels.to(device)
+
+            # 提取特征
+            features = feature_extractor(images)  # 确保你有 FeatureExtractor 类
+            
+            outputs = model(features)
+            
+            # 计算预测准确度
+            _, predicted = torch.max(outputs, 1)
+            total += labels.size(0)
+            correct += (predicted == labels).sum().item()
+
+    accuracy = 100 * correct / total
+    print(f"[Test] Test Accuracy: {accuracy:.2f}%")
+    return accuracy
+
+
+def simulate_edge_cloud_inference(drone, cloud_server, test_loader, device, ):
+    print("\n=== 开始『边云协同』在线仿真 ===")
+    count = 0
+    # 遍历测试集，并使用进度条
+    correct = 0
+    total = 0
+    for images, labels in test_loader:
+        for i in range(images.size(0)):
+            img = images[i]
+            label = labels[i]
+            
+            # 无人机采集图像
+            drone.capture_image(img)
+            # 无人机端 -> 提取128维特征 -> 上传云端
+            print(f"[Image #{count+1}] 无人机先上传特征 -> 云端决策")
+            outputs = drone.send_feature_to_cloud(cloud_server)
+            
+            _, predicted = torch.max(outputs, 1)
+            total += 1
+            correct += (predicted == label).sum().item()
+            count += 1
+
+    accuracy = 100 * correct / total
+    print(f"[Test] Test Accuracy: {accuracy:.2f}%")
+
+    print(f"请求原图比例: {cloud_server.num/count:.2f}")
+    
+    return accuracy
+            
+
+
 # ------------------------------------------------------------------------------------
 # 10. 主函数
 # ------------------------------------------------------------------------------------
@@ -491,32 +696,33 @@ def main():
     # ========== 步骤4：可视化评估决策网络 ========== #
     print("\n==== 评估决策网络 ====")
     evaluate_decision_net(decision_net, features_tensor, labels_tensor, device)
+
+
+    # ========== 步骤5：模拟线上场景：无人机只提取128维特征 -> 云端根据决策网络判断 ========== #
+    classifier_serve = train_classifier(classifier_serve, train_loader, test_loader, device, epochs=5, lr=1e-3)
+
+    model_path = "classifier_serve.pth"
+    torch.save(classifier_serve.state_dict(), model_path)
+    print(f"模型权重已保存至 {model_path}")
+
+
+    backbone = classifier.get_backbone()
+    serve_features_classifer = ServeFeaturesClassifier()
+    serve_features_classifer = train_feature_classifier(serve_features_classifer,backbone ,train_loader, test_loader, device, epochs=1, lr=1e-3)
+
     
     # ========== 步骤5：模拟线上场景：无人机只提取128维特征 -> 云端根据决策网络判断 ========== #
     print("\n==== 模拟边云协同场景 ====")
-    # 构建无人机：使用分类器的backbone (并冻结)
-    backbone = classifier.get_backbone()
-    drone = Drone(backbone, device)
     
-    # 构建云服务器
-    cloud_server = CloudServer(decision_net, device)
-    
-    simulate_edge_cloud_inference(drone, cloud_server, test_loader, device, num_images=10)
-    
-    # ========== 步骤6：对比『有决策网络』 vs 『无决策网络』 ========== #
-    print("\n==== 对比场景A/B/C 的 效果 ====")
-    # 使用测试集对比三种场景
-    test_loader_compare = DataLoader(cifar_test, batch_size=64, shuffle=False, num_workers=2)
-    results = compare_scenarios(classifier, decision_net, test_loader_compare, device, threshold=0.8)
-    # results 是字典 {'A':(accA, ratioA), 'B':(accB, ratioB), 'C':(accC, ratioC)}
-    
-    # 打印比较结果
-    print("场景A (Always Raw):    accuracy = {:.3f}, raw ratio = {:.3f}".format(*results['A']))
-    print("场景B (Never Raw):     accuracy = {:.3f}, raw ratio = {:.3f}".format(*results['B']))
-    print("场景C (Decision Net):  accuracy = {:.3f}, raw ratio = {:.3f}".format(*results['C']))
-    
-    # 可视化对比
-    plot_comparison(results)
+
+    drone = Drone(backbone,device)
+    abc = bandwise_limitation(0)
+    cloud_server = CloudServer(decision_net, device,serve_features_classifer,classifier_serve,abc)
+
+
+    simulate_edge_cloud_inference(drone, cloud_server, test_loader, device)         
+
+
 
 if __name__ == "__main__":
     main()
